@@ -1,111 +1,118 @@
-import pygame
 import math
 
-class Car:
+import arcade
+from PIL import Image, ImageDraw
+
+from constants import (
+    MAX_SPEED, REVERSE_MAX, BASE_ACCEL, BRAKE_FORCE, REVERSE_ACCEL,
+    FRICTION, TURN_RATE,
+    CAR_WIDTH, CAR_HEIGHT, CAR_HALF_L, CAR_HALF_W,
+)
+
+_CAR_TEXTURE = None
+
+
+def _car_texture():
+    global _CAR_TEXTURE
+    if _CAR_TEXTURE is None:
+        img = Image.new("RGBA", (CAR_WIDTH, CAR_HEIGHT), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rectangle([1, 2, CAR_WIDTH - 2, CAR_HEIGHT - 3], fill=(220, 40, 50))
+        for wx in (4, CAR_WIDTH - 11):
+            d.rectangle([wx, 0, wx + 7, 2],                      fill=(20, 20, 20))
+            d.rectangle([wx, CAR_HEIGHT - 2, wx + 7, CAR_HEIGHT - 1], fill=(20, 20, 20))
+        d.rectangle([3, CAR_HEIGHT // 2 - 1, CAR_WIDTH - 12,
+                     CAR_HEIGHT // 2 + 1], fill=(245, 245, 245))
+        d.rectangle([CAR_WIDTH - 13, 4, CAR_WIDTH - 5, CAR_HEIGHT - 5],
+                    fill=(40, 50, 70))
+        _CAR_TEXTURE = arcade.Texture(img)
+    return _CAR_TEXTURE
+
+
+class Car(arcade.Sprite):
+    """
+    Heading convention:
+      * self._heading is in RADIANS, math/CCW-positive, 0 = facing +x.
+      * self.angle (from Sprite) is in DEGREES, arcade/CW-positive.
+      * Because arcade has Y-up but rotates CW, the two differ by a sign:
+            self.angle = -math.degrees(self._heading)
+      * All physics and raycasting uses self._heading (exposed as `heading`).
+    """
+
     def __init__(self, x, y):
-        self.x = float(x)
-        self.y = float(y)
-        self.angle = 0.0
-        self.speed = 0.0
-        self.steer = 0.0
+        super().__init__(_car_texture(), center_x=float(x), center_y=float(y))
+        self.speed     = 0.0
+        self.steer     = 0.0
+        self.throttle  = 0.0
+        self._heading  = 0.0
 
-        # New: Variable throttle system
-        self.throttle_input = 0.0      # how hard the player is pressing (0.0 to 1.0)
-        self.current_throttle = 0.0    # smoothed throttle value
+    @property
+    def heading(self):
+        return self._heading
 
-        # Physics settings
-        self.MAX_SPEED = 9.0
-        self.REVERSE_MAX = -5.5
-        self.BASE_ACCEL = 0.18         # base acceleration when throttle is full
-        self.BRAKE = 0.42
-        self.REVERSE_ACCEL = 0.11
-        self.FRICTION = 0.955
-        self.TURN_RATE = 0.055
-        self.STEER_RESPONSE = 0.19
-        self.STEER_RETURN = 0.25
-
-        # Create car sprite
-        w, h = 34, 17
-        self.image = pygame.Surface((w, h), pygame.SRCALPHA)
-        pygame.draw.rect(self.image, (220, 40, 50), (1, 1, w-2, h-2), border_radius=4)
-        pygame.draw.rect(self.image, (40, 50, 70), (w-13, 4, 8, h-8))
-        pygame.draw.rect(self.image, (245, 245, 245), (3, h//2-1, w-15, 2))
-
-    def update(self, keys, on_track_func):
-        """Update car with variable acceleration"""
-        
-        # === Steering (unchanged) ===
+    def update_physics(self, keys, on_track_func):
+        # --- steering (smoothed) ---
         target_steer = 0.0
-        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-            target_steer -= 1.0
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-            target_steer += 1.0
-
-        if target_steer == 0:
-            self.steer += (0 - self.steer) * self.STEER_RETURN
-        else:
-            self.steer += (target_steer - self.steer) * self.STEER_RESPONSE
+        if arcade.key.LEFT  in keys or arcade.key.A in keys: target_steer -= 1.0
+        if arcade.key.RIGHT in keys or arcade.key.D in keys: target_steer += 1.0
+        smoothing = 0.19 if target_steer != 0 else 0.25
+        self.steer += (target_steer - self.steer) * smoothing
         self.steer = max(-1.0, min(1.0, self.steer))
 
-        # === Variable Throttle Input ===
-        if keys[pygame.K_UP] or keys[pygame.K_w]:
-            self.throttle_input = min(self.throttle_input + 0.12, 1.0)   # ramp up
-        else:
-            self.throttle_input = max(self.throttle_input - 0.15, 0.0)   # ramp down
+        # --- throttle (smoothed, ranges -1..+1: W=+1, S=-1, both/neither=0) ---
+        target_throttle = 0.0
+        if arcade.key.UP   in keys or arcade.key.W in keys: target_throttle += 1.0
+        if arcade.key.DOWN in keys or arcade.key.S in keys: target_throttle -= 1.0
+        rate = 0.15
+        if target_throttle > self.throttle:
+            self.throttle = min(self.throttle + rate, target_throttle)
+        elif target_throttle < self.throttle:
+            self.throttle = max(self.throttle - rate, target_throttle)
 
-        # Smooth the actual throttle
-        self.current_throttle = self.current_throttle * 0.75 + self.throttle_input * 0.25
-
-        # === Acceleration & Braking ===
-        if self.throttle_input > 0.05:                    # forward throttle
-            accel_amount = self.BASE_ACCEL * self.current_throttle
-            self.speed += accel_amount
-
-        elif keys[pygame.K_DOWN] or keys[pygame.K_s]:     # braking / reverse
+        # --- accel / brake / reverse ---
+        if self.throttle > 0:
+            self.speed += BASE_ACCEL * self.throttle
+        elif self.throttle < 0:
             if self.speed > 0.4:
-                self.speed -= self.BRAKE                  # strong brake
+                # moving forward while S pressed -> brake hard
+                self.speed -= BRAKE_FORCE * abs(self.throttle)
             else:
-                self.speed -= self.REVERSE_ACCEL          # go into reverse
+                # stopped or already reversing -> gentler reverse accel
+                self.speed += REVERSE_ACCEL * self.throttle
 
-        # Natural friction
-        self.speed *= self.FRICTION
-        self.speed = max(self.REVERSE_MAX, min(self.MAX_SPEED, self.speed))
+        self.speed *= FRICTION
+        self.speed = max(REVERSE_MAX, min(MAX_SPEED, self.speed))
 
-        # === Turning (depends on speed) ===
+        # --- turn heading ---
+        # steer>0 means RIGHT. In Y-up world a right turn is CW = heading DECREASES.
+        # dir_sign flips turning when reversing.
         speed_factor = min(abs(self.speed) / 3.5, 1.0)
-        dir_sign = 1 if self.speed >= 0 else -1
-        self.angle += self.steer * self.TURN_RATE * speed_factor * dir_sign
+        dir_sign     = 1 if self.speed >= 0 else -1
+        self._heading -= self.steer * TURN_RATE * speed_factor * dir_sign
 
-        # === Movement + Collision ===
-        dx = self.speed * math.cos(self.angle)
-        dy = self.speed * math.sin(self.angle)
-        new_x = self.x + dx
-        new_y = self.y + dy
+        # --- sync sprite angle (arcade CW degrees) ---
+        self.angle = -math.degrees(self._heading)
 
-        if self.is_on_track(new_x, new_y, on_track_func):
-            self.x, self.y = new_x, new_y
-        elif self.is_on_track(new_x, self.y, on_track_func):
-            self.x = new_x
+        # --- movement + axis-slide collision ---
+        dx = self.speed * math.cos(self._heading)
+        dy = self.speed * math.sin(self._heading)
+        nx, ny = self.center_x + dx, self.center_y + dy
+
+        if self._footprint_on_track(nx, ny, on_track_func):
+            self.center_x, self.center_y = nx, ny
+        elif self._footprint_on_track(nx, self.center_y, on_track_func):
+            self.center_x = nx
             self.speed *= 0.68
-        elif self.is_on_track(self.x, new_y, on_track_func):
-            self.y = new_y
+        elif self._footprint_on_track(self.center_x, ny, on_track_func):
+            self.center_y = ny
             self.speed *= 0.68
         else:
             self.speed *= 0.28
 
-    def is_on_track(self, x, y, on_track_func):
-        c = math.cos(self.angle)
-        s = math.sin(self.angle)
-        CAR_HALF_L = 12
-        CAR_HALF_W = 6
-        
-        for ox, oy in [(CAR_HALF_L, CAR_HALF_W), (CAR_HALF_L, -CAR_HALF_W),
-                       (-CAR_HALF_L, CAR_HALF_W), (-CAR_HALF_L, -CAR_HALF_W)]:
+    def _footprint_on_track(self, x, y, on_track_func):
+        c, s = math.cos(self._heading), math.sin(self._heading)
+        for ox, oy in ((CAR_HALF_L, CAR_HALF_W), (CAR_HALF_L, -CAR_HALF_W),
+                       (-CAR_HALF_L, CAR_HALF_W), (-CAR_HALF_L, -CAR_HALF_W)):
             if not on_track_func(x + ox * c - oy * s, y + ox * s + oy * c):
                 return False
         return True
-
-    def draw(self, screen):
-        rotated = pygame.transform.rotate(self.image, -math.degrees(self.angle))
-        rect = rotated.get_rect(center=(int(self.x), int(self.y)))
-        screen.blit(rotated, rect)

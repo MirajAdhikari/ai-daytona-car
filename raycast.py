@@ -1,49 +1,52 @@
 import math
-import pygame
 
-def cast_rays(x, y, angle, on_track_func, NUM_RAYS=8, RAY_LENGTH=220):
-    """Improved raycasting - more accurate and smooth"""
+import arcade
+
+from constants import NUM_RAYS, RAY_LENGTH, RAY_SPREAD, RAY_STEP, CAR_HALF_L
+
+# Pre-compute per-ray angular offsets (degrees from car heading)
+if NUM_RAYS > 1:
+    _RAY_OFFSETS = [
+        -RAY_SPREAD / 2 + i * RAY_SPREAD / (NUM_RAYS - 1)
+        for i in range(NUM_RAYS)
+    ]
+else:
+    _RAY_OFFSETS = [0.0]
+
+
+def _ray_origin(car_x, car_y, car_angle):
+    """Rays emanate from the front bumper, not the car's center."""
+    return (car_x + math.cos(car_angle) * CAR_HALF_L,
+            car_y + math.sin(car_angle) * CAR_HALF_L)
+
+
+def cast_rays(car_x, car_y, car_angle, on_track_func):
+    """Return distance from the front of the car to the nearest off-track
+    hit for each of NUM_RAYS rays. RAY_LENGTH if no hit within range."""
+    ox, oy = _ray_origin(car_x, car_y, car_angle)
     distances = []
-    
-    for i in range(NUM_RAYS):
-        ray_angle = angle + math.radians(-60 + (i * 120 / (NUM_RAYS - 1)))
-        dx = math.cos(ray_angle)
-        dy = math.sin(ray_angle)
-        
-        distance = RAY_LENGTH
-        step = 2.0  # finer steps for smoother feel
-        
-        for dist in range(0, int(RAY_LENGTH), int(step)):
-            check_x = x + dx * dist
-            check_y = y + dy * dist
-            
-            if not on_track_func(check_x, check_y):
-                distance = dist
+    for off_deg in _RAY_OFFSETS:
+        a  = car_angle + math.radians(off_deg)
+        dx = math.cos(a)
+        dy = math.sin(a)
+        hit = RAY_LENGTH
+        d = 0.0
+        while d < RAY_LENGTH:
+            if not on_track_func(ox + dx * d, oy + dy * d):
+                hit = d
                 break
-                
-        distances.append(distance)
-    
+            d += RAY_STEP
+        distances.append(hit)
     return distances
 
 
-def draw_rays(screen, x, y, angle, distances, CAR_HALF_L=12):
-    """Draw smooth, clean rays"""
-    c = math.cos(angle)
-    s = math.sin(angle)
-    car_front_x = x + CAR_HALF_L * c
-    car_front_y = y + CAR_HALF_L * s
-
-    for i, dist in enumerate(distances):
-        ray_angle = angle + math.radians(-60 + (i * 120 / (len(distances) - 1)))
-        dx = math.cos(ray_angle)
-        dy = math.sin(ray_angle)
-        
-        end_x = car_front_x + dist * dx
-        end_y = car_front_y + dist * dy
-        
-        # Smooth color gradient
-        color = (0, 255, 0) if dist > 100 else (255, 100, 0) if dist > 50 else (255, 50, 50)
-        pygame.draw.line(screen, color, 
-                        (int(car_front_x), int(car_front_y)), 
-                        (int(end_x), int(end_y)), 
-                        3)  # thicker line for better visibility
+def draw_rays(car_x, car_y, car_angle, distances):
+    ox, oy = _ray_origin(car_x, car_y, car_angle)
+    for off_deg, dist in zip(_RAY_OFFSETS, distances):
+        a  = car_angle + math.radians(off_deg)
+        ex = ox + dist * math.cos(a)
+        ey = oy + dist * math.sin(a)
+        if   dist > 140: color = (0, 255, 100)
+        elif dist > 70:  color = (255, 190, 40)
+        else:            color = (255, 70, 70)
+        arcade.draw_line(ox, oy, ex, ey, color, line_width=3)
