@@ -19,7 +19,7 @@ def _car_texture():
         d = ImageDraw.Draw(img)
         d.rectangle([1, 2, CAR_WIDTH - 2, CAR_HEIGHT - 3], fill=(220, 40, 50))
         for wx in (4, CAR_WIDTH - 11):
-            d.rectangle([wx, 0, wx + 7, 2],                      fill=(20, 20, 20))
+            d.rectangle([wx, 0, wx + 7, 2],                           fill=(20, 20, 20))
             d.rectangle([wx, CAR_HEIGHT - 2, wx + 7, CAR_HEIGHT - 1], fill=(20, 20, 20))
         d.rectangle([3, CAR_HEIGHT // 2 - 1, CAR_WIDTH - 12,
                      CAR_HEIGHT // 2 + 1], fill=(245, 245, 245))
@@ -30,28 +30,30 @@ def _car_texture():
 
 
 class Car(arcade.Sprite):
-    """
-    Heading convention:
-      * self._heading is in RADIANS, math/CCW-positive, 0 = facing +x.
-      * self.angle (from Sprite) is in DEGREES, arcade/CW-positive.
-      * Because arcade has Y-up but rotates CW, the two differ by a sign:
-            self.angle = -math.degrees(self._heading)
-      * All physics and raycasting uses self._heading (exposed as `heading`).
-    """
 
     def __init__(self, x, y):
         super().__init__(_car_texture(), center_x=float(x), center_y=float(y))
-        self.speed     = 0.0
-        self.steer     = 0.0
-        self.throttle  = 0.0
-        self._heading  = 0.0
+        self.speed      = 0.0
+        self.steer      = 0.0
+        self.throttle   = 0.0
+        self._heading   = 0.0
+        self.alive      = True
+        self.fitness    = 0.0
+        self._wall_hits = 0
+        self.neural_net = None
+        # lap counter
+        self.laps                  = 0
+        self._on_finish_last_frame = False
+        self._distance_since_spawn = 0
+        # no-progress death
+        self._frames_alive       = 0
+        self._frames_no_progress = 0
 
     @property
     def heading(self):
         return self._heading
 
     def update_physics(self, keys, on_track_func):
-        # --- steering (smoothed) ---
         target_steer = 0.0
         if arcade.key.LEFT  in keys or arcade.key.A in keys: target_steer -= 1.0
         if arcade.key.RIGHT in keys or arcade.key.D in keys: target_steer += 1.0
@@ -59,7 +61,6 @@ class Car(arcade.Sprite):
         self.steer += (target_steer - self.steer) * smoothing
         self.steer = max(-1.0, min(1.0, self.steer))
 
-        # --- throttle (smoothed, ranges -1..+1: W=+1, S=-1, both/neither=0) ---
         target_throttle = 0.0
         if arcade.key.UP   in keys or arcade.key.W in keys: target_throttle += 1.0
         if arcade.key.DOWN in keys or arcade.key.S in keys: target_throttle -= 1.0
@@ -69,31 +70,21 @@ class Car(arcade.Sprite):
         elif target_throttle < self.throttle:
             self.throttle = max(self.throttle - rate, target_throttle)
 
-        # --- accel / brake / reverse ---
         if self.throttle > 0:
             self.speed += BASE_ACCEL * self.throttle
         elif self.throttle < 0:
             if self.speed > 0.4:
-                # moving forward while S pressed -> brake hard
                 self.speed -= BRAKE_FORCE * abs(self.throttle)
             else:
-                # stopped or already reversing -> gentler reverse accel
                 self.speed += REVERSE_ACCEL * self.throttle
-
         self.speed *= FRICTION
         self.speed = max(REVERSE_MAX, min(MAX_SPEED, self.speed))
 
-        # --- turn heading ---
-        # steer>0 means RIGHT. In Y-up world a right turn is CW = heading DECREASES.
-        # dir_sign flips turning when reversing.
         speed_factor = min(abs(self.speed) / 3.5, 1.0)
         dir_sign     = 1 if self.speed >= 0 else -1
         self._heading -= self.steer * TURN_RATE * speed_factor * dir_sign
-
-        # --- sync sprite angle (arcade CW degrees) ---
         self.angle = -math.degrees(self._heading)
 
-        # --- movement + axis-slide collision ---
         dx = self.speed * math.cos(self._heading)
         dy = self.speed * math.sin(self._heading)
         nx, ny = self.center_x + dx, self.center_y + dy
@@ -108,6 +99,68 @@ class Car(arcade.Sprite):
             self.speed *= 0.68
         else:
             self.speed *= 0.28
+
+    def update_physics_ai(self, steer_target, throttle_target, on_track_func):
+        self._frames_alive += 1
+
+        if self.speed < 0.5:
+            self._frames_no_progress += 1
+        else:
+            self._frames_no_progress = 0
+
+        if self._frames_no_progress > 180 or self._frames_alive > 4000:
+            self.alive = False
+            return
+
+        smoothing = 0.19 if steer_target != 0 else 0.25
+        self.steer += (steer_target - self.steer) * smoothing
+        self.steer = max(-1.0, min(1.0, self.steer))
+
+        rate = 0.15
+        if throttle_target > self.throttle:
+            self.throttle = min(self.throttle + rate, throttle_target)
+        elif throttle_target < self.throttle:
+            self.throttle = max(self.throttle - rate, throttle_target)
+
+        if self.throttle > 0:
+            self.speed += BASE_ACCEL * self.throttle
+        elif self.throttle < 0:
+            if self.speed > 0.4:
+                self.speed -= BRAKE_FORCE * abs(self.throttle)
+            else:
+                self.speed += REVERSE_ACCEL * self.throttle
+        self.speed *= FRICTION
+        self.speed = max(REVERSE_MAX, min(MAX_SPEED, self.speed))
+
+        speed_factor = min(abs(self.speed) / 3.5, 1.0)
+        dir_sign = 1 if self.speed >= 0 else -1
+        self._heading -= self.steer * TURN_RATE * speed_factor * dir_sign
+        self.angle = -math.degrees(self._heading)
+
+        dx = self.speed * math.cos(self._heading)
+        dy = self.speed * math.sin(self._heading)
+        nx, ny = self.center_x + dx, self.center_y + dy
+
+        if self._footprint_on_track(nx, ny, on_track_func):
+            self.center_x, self.center_y = nx, ny
+            self._wall_hits = 0
+        elif self._footprint_on_track(nx, self.center_y, on_track_func):
+            self.center_x = nx
+            self.speed *= 0.68
+            self._wall_hits += 1
+        elif self._footprint_on_track(self.center_x, ny, on_track_func):
+            self.center_y = ny
+            self.speed *= 0.68
+            self._wall_hits += 1
+        else:
+            self.speed *= 0.28
+            self._wall_hits += 1
+
+        self.fitness += max(0.0, self.speed)
+        self._distance_since_spawn += max(0.0, self.speed)
+
+        if self._wall_hits > 30:
+            self.alive = False
 
     def _footprint_on_track(self, x, y, on_track_func):
         c, s = math.cos(self._heading), math.sin(self._heading)
